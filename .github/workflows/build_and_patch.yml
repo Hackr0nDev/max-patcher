@@ -3,122 +3,115 @@ name: Build Patched APK
 on:
   workflow_dispatch:
     inputs:
-      experimental:
-        description: 'Enable experimental Smali patches (e.g., logging). Disable if app crashes.'
-        required: false
-        type: boolean
-        default: true
-      permsRemoval:
-        description: 'Permission removal level. More removal may break features.'
+      apk_url:
+        description: "Direct link to ru.oneme.app.apk (MAX.apk)"
+        type: string
         required: true
-        default: 'strict'
+        default: "https://download.max.ru/android/release/google/MAX.apk"
+      permsRemoval:
+        description: "Удаление разрешений из манифеста"
         type: choice
+        required: true
+        default: strict
         options:
-          - 'none'
-          - 'dangerous'
-          - 'strict'
-          - 'paranoid'
+          - none
+          - dangerous
+          - strict
+      experimental:
+        description: "Включить экспериментальные smali-патчи"
+        type: boolean
+        required: true
+        default: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+      APK_NAME: ru.oneme.app.apk
+      OUT_DIR: build/out
+      BUILD_DIR: build
+      BUILD_TOOLS_VERSION: "35.0.0"
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '17'
+      - name: Set up Java (Temurin 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
-    - name: Download Apktool
-      run: |
-        wget https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O apktool.jar
-        sudo mv apktool.jar /usr/local/bin/apktool.jar
-        echo '#!/bin/bash' | sudo tee /usr/local/bin/apktool
-        echo 'java -jar /usr/local/bin/apktool.jar "$@"' | sudo tee -a /usr/local/bin/apktool
-        sudo chmod +x /usr/local/bin/apktool
+      - name: Set up Android SDK (cmdline tools + platform-tools)
+        uses: android-actions/setup-android@v3
 
-    - name: Set up Android SDK
-      uses: android-actions/setup-android@v3
-      with:
-        packages: 'platform-tools build-tools;34.0.0'
+      - name: Install Android Build-Tools (${{ env.BUILD_TOOLS_VERSION }})
+        run: |
+          sdkmanager --install "build-tools;${BUILD_TOOLS_VERSION}"
+          echo "ZIPALIGN=$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}/zipalign" >> "$GITHUB_ENV"
+          echo "APKSIGNER=$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}/apksigner" >> "$GITHUB_ENV"
 
-    - name: Add Android Build Tools to PATH
-      run: echo "${ANDROID_HOME}/build-tools/34.0.0" >> $GITHUB_PATH
-      shell: bash
+      - name: Install apktool (wrapper + latest jar)
+        run: |
+          sudo curl -L -o /usr/local/bin/apktool https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool
+          sudo curl -L -o /usr/local/bin/apktool.jar https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool.jar
+          sudo chmod +x /usr/local/bin/apktool
 
-    - name: Decompile APK
-      run: apktool d source_apk/ru.oneme.app.apk -f -o apk_workdir
+      - name: Download source APK
+        env:
+          APK_URL: ${{ inputs.apk_url }}
+        run: |
+          mkdir -p source_apk
+          curl -L "$APK_URL" -o "source_apk/${APK_NAME}"
+          ls -lh source_apk
+          sha256sum "source_apk/${APK_NAME}" | tee "${{ env.BUILD_DIR }}/apk.sha256"
 
+      - name: Decompile (apktool d)
+        run: |
+          rm -rf "${OUT_DIR}"
+          mkdir -p "${BUILD_DIR}"
+          apktool d -f -o "${OUT_DIR}" "source_apk/${APK_NAME}"
 
-    - name: Remove original AndroidManifest.xml copy in workdir (if exists)
-      run: |
-        if [ -f "apk_workdir/original/AndroidManifest.xml" ]; then
-          echo "Removing apk_workdir/original/AndroidManifest.xml to prevent conflicts"
-          rm "apk_workdir/original/AndroidManifest.xml"
-        fi
-      shell: bash
+      - name: Apply patches (python scripts/patcher.py)
+        env:
+          permsRemoval: ${{ inputs.permsRemoval }}
+          experimental: ${{ inputs.experimental }}
+          PERMS_REMOVAL: ${{ inputs.permsRemoval }}   # дублируем, если скрипт читает другое имя
+          EXPERIMENTAL: ${{ inputs.experimental }}
+        run: |
+          python3 --version
+          python3 scripts/patcher.py "${OUT_DIR}"
 
-    - name: Patch AndroidManifest.xml based on user selection
-      if: ${{ inputs.permsRemoval != 'none' }}
-      run: |
-        echo "Permission removal level selected: ${{ inputs.permsRemoval }}"
-        SOURCE_MANIFEST="manifests/AndroidManifest_${{ inputs.permsRemoval }}.xml"
-        DEST_MANIFEST="apk_workdir/AndroidManifest.xml"
-        echo "Copying ${SOURCE_MANIFEST} to ${DEST_MANIFEST}"
-        cp "${SOURCE_MANIFEST}" "${DEST_MANIFEST}"
-      shell: bash
+      - name: Build back (apktool b)
+        run: |
+          apktool b "${OUT_DIR}" -o "${BUILD_DIR}/unsigned.apk"
+          ls -lh "${BUILD_DIR}/unsigned.apk"
 
-    - name: Run Python Patcher for Smali
-      run: python scripts/patcher.py --experimental "${{ inputs.experimental }}"
-      env:
-        EXPERIMENTAL: ${{ inputs.experimental }}
+      - name: Zipalign
+        run: |
+          "$ZIPALIGN" -v 4 "${BUILD_DIR}/unsigned.apk" "${BUILD_DIR}/aligned.apk"
+          ls -lh "${BUILD_DIR}/aligned.apk"
 
-    - name: Remove original signature
-      run: |
-        rm -rf apk_workdir/original/META-INF
-        rm -f apk_workdir/original/stamp-cert-sha256
-      shell: bash
+      - name: Generate debug keystore
+        run: |
+          keytool -genkeypair -keystore "${BUILD_DIR}/debug.keystore" -alias androiddebugkey \
+            -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
 
-    - name: Rebuild APK
-      run: apktool b apk_workdir -c -o rebuilt_unsigned.apk
-      shell: bash
+      - name: Sign (apksigner)
+        run: |
+          "$APKSIGNER" sign --ks "${BUILD_DIR}/debug.keystore" \
+            --ks-pass pass:android --key-pass pass:android \
+            --out "${BUILD_DIR}/patched-app-release.apk" "${BUILD_DIR}/aligned.apk"
+          "$APKSIGNER" verify --print-certs "${BUILD_DIR}/patched-app-release.apk"
+          ls -lh "${BUILD_DIR}/patched-app-release.apk"
 
-    - name: Zipalign the APK
-      run: zipalign -v 4 rebuilt_unsigned.apk rebuilt_aligned.apk
-      shell: bash
-
-    - name: Generate a temporary signing key
-      run: |
-        keytool -genkey -v \
-          -keystore temp-release-key.keystore \
-          -alias temp_alias \
-          -keyalg RSA \
-          -keysize 2048 \
-          -validity 10000 \
-          -storepass temppassword \
-          -keypass temppassword \
-          -dname "CN=Anonymous, OU=Anonymous, O=Anonymous, L=Unknown, ST=Unknown, C=XX"
-      shell: bash
-
-    - name: Sign the APK with the temporary key
-      run: |
-        apksigner sign --ks temp-release-key.keystore \
-        --ks-key-alias temp_alias \
-        --ks-pass pass:temppassword \
-        --key-pass pass:temppassword \
-        rebuilt_aligned.apk
-      shell: bash
-
-    - name: Rename Final APK
-      run: mv rebuilt_aligned.apk patched-app-release.apk
-      shell: bash
-
-    - name: Upload Patched APK as Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: patched-apk-${{ inputs.permsRemoval }}
-        path: patched-app-release.apk
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-app-release
+          path: |
+            build/patched-app-release.apk
+            build/apk.sha256
+          retention-days: 14
